@@ -12,12 +12,7 @@ const BETWEEN_LOCATIONS_MS = [2_000, 3_500];
 const SLOWMO_MS = 60;                        
 
 const LOCATIONS = [
-  'Hurstville NSW','Lindfield','Mascot','Millers Point','Mosman','Neutral Bay','Oatley NSW',
-  'Penrith','Potts Point NSW','Redfern','Rockdale','Rooty Hill','Rose Bay','Rosebery','Rozelle',
-  'Rushcutters Bay','Sans Souci','Seaforth','Seven Hills','St Leonards','St Peters',
-  'Stanmore','Summer Hill','Surry Hills','Sutherland','Sydney','Tamarama','The Rocks',
-  'Turramurra','Ultimo','Vaucluse','Wahroonga','Waterloo','Waverley','Willoughby',
-  'Woollahra','Woolloomooloo','Zetland'
+  
 ];
 
 function makeUA() {
