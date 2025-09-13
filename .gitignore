@@ -1,0 +1,35 @@
+# Node dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Laravel & PHP
+/vendor/
+.env
+.env.*
+.phpunit.result.cache
+/storage/*.key
+/storage/logs/
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+/bootstrap/cache/*.php
+
+# IDE & OS junk
+*.DS_Store
+*.idea
+*.vscode
+Thumbs.db
+
+# Build / Dist
+/dist
+/public/hot
+/public/storage
+/public/mix-manifest.json
+
+# Logs
+*.log
+
+# Other
+coverage/
