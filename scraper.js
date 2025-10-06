@@ -6,24 +6,41 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const jitter = (min, max) => Math.floor(min + Math.random() * (max - min));
 const rand = (a, b) => jitter(a, b);
 
-const MAX_RETRIES_PER_LOCATION = 4;          
-const BASE_BACKOFF_MS = 60_000;              
-const BETWEEN_LOCATIONS_MS = [2_000, 3_500]; 
-const SLOWMO_MS = 60;                        
+const MAX_RETRIES_PER_LOCATION = 4;
+const BASE_BACKOFF_MS = 60_000;
+const BETWEEN_LOCATIONS_MS = [2_000, 3_500];
+const BETWEEN_BATCH_MS = [3 * 60_000, 5 * 60_000]; // 3-5 minutes
+const SLOWMO_MS = 60;
+const BATCH_SIZE = 5;
 
 const LOCATIONS = [
-  
+  "Allandale",
+  "Allenstown", "Allenview", "Alligator Creek", "Allora", "Alloway",
+  "Almaden", "Aloomba", "Alpha", "Alsace", "Alton Downs",
+  "Alva", "Amamoor", "Amamoor Creek", "Amaroo", "Amber",
+  "Amberley", "Ambrose", "Amby", "Amiens", "Amity",
+  "Anakie Siding", "Andergrove", "Anderleigh", "Andromache", "Anduramba",
+  "Annandale", "Annerley", "Anstead", "Anthony", "Antigua",
+  "Apple Tree Creek", "Applethorpe", "Arafura Sea", "Araluen", "Aramac",
+  "Aramara", "Arana Hills", "Aranbanga", "Aratula", "Arbouin",
+  "Arcadia", "Arcadia Valley", "Archer River", "Archerfield", "Arcturus",
+  "Argyll", "Armstrong Beach", "Armstrong Creek", "Aroona", "Arriga",
+  "Arundel", "Ascot", "Ashfield", "Ashgrove", "Ashmore",
+  "Ashwell", "Aspley", "Atherton", "Athol", "Atkinsons Dam",
+  "Aubigny", "Auburn", "Auchenflower", "Augathella", "Augustine Heights",
+  "Aurukun", "Austinville", "Avenell Heights", "Avoca", "Avoca Vale",
+  "Avondale", "Ayr"
 ];
 
 function makeUA() {
-  const chromeMajor = 120 + Math.floor(Math.random() * 5); // 120–124
+  const chromeMajor = 120 + Math.floor(Math.random() * 5);
   return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 `
        + `(KHTML, like Gecko) Chrome/${chromeMajor}.0.0.0 Safari/537.36`;
 }
 
 async function launchBrowser() {
   return puppeteer.launch({
-    headless: false, // set true in CI
+    headless: false, // change to true in CI
     slowMo: SLOWMO_MS,
     args: [
       '--no-sandbox',
@@ -33,7 +50,6 @@ async function launchBrowser() {
   });
 }
 
-// Detect rate limiting via network + content
 function attachRateLimitDetectors(page) {
   const signals = { rateLimited: false, cloudflare1015: false };
 
@@ -41,15 +57,11 @@ function attachRateLimitDetectors(page) {
     try {
       const status = res.status();
       if (status === 429) signals.rateLimited = true;
-      // Optional: watch specific Cloudflare endpoints if needed
     } catch { /* ignore */ }
   });
 
-  page.on('requestfailed', (req) => {
-    // not strictly a rate limit signal, but can accompany 1015/429 storms
-  });
+  page.on('requestfailed', (req) => { /* optional hook */ });
 
-  // Periodic DOM checks for Cloudflare 1015 page
   const checkDom = async () => {
     try {
       const html = (await page.content()).toLowerCase();
@@ -60,7 +72,6 @@ function attachRateLimitDetectors(page) {
     } catch { /* ignore */ }
   };
 
-  // Run a few times early; caller can also invoke on demand
   const timer = setInterval(checkDom, 1500);
 
   return {
@@ -77,7 +88,6 @@ async function waitOnBlock(signals, attempt) {
     await sleep(cool);
     return;
   }
-  // Generic 429/backoff: exponential with jitter
   const backoff = BASE_BACKOFF_MS * Math.pow(2, Math.max(0, attempt - 1));
   const withJitter = backoff + rand(5_000, 25_000);
   console.warn(`⏳ Rate limit/backoff: waiting ${(withJitter/1000).toFixed(0)}s (attempt ${attempt})...`);
@@ -134,7 +144,6 @@ async function runOnce(location, attempt = 1) {
     await Promise.race([
       page.waitForSelector('li.resultItem', { timeout: 30_000 }),
       (async () => {
-        // If blocked mid-wait
         for (let i = 0; i < 20; i++) {
           await detectors.checkDom();
           if (detectors.signals.rateLimited) throw new Error('Rate limited while waiting for results');
@@ -205,9 +214,25 @@ async function runOnce(location, attempt = 1) {
 }
 
 (async () => {
-  for (const loc of LOCATIONS) {
-    await runOnce(loc);
-    await sleep(rand(BETWEEN_LOCATIONS_MS[0], BETWEEN_LOCATIONS_MS[1]));
+  console.log(`Starting scrape: ${LOCATIONS.length} locations, batch size ${BATCH_SIZE}.`);
+  for (let i = 0; i < LOCATIONS.length; i += BATCH_SIZE) {
+    const batch = LOCATIONS.slice(i, i + BATCH_SIZE);
+    console.log(`\n--- Starting batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} locations) ---`);
+    for (const loc of batch) {
+      await runOnce(loc);
+      // small pause between locations to mimic human behavior
+      await sleep(rand(BETWEEN_LOCATIONS_MS[0], BETWEEN_LOCATIONS_MS[1]));
+    }
+
+    if (i + BATCH_SIZE < LOCATIONS.length) {
+      // cooldown between batches (3-5 minutes randomized)
+      const cooldown = rand(BETWEEN_BATCH_MS[0], BETWEEN_BATCH_MS[1]);
+      const minutes = (cooldown / 60000).toFixed(2);
+      console.log(`\n🛌 Batch complete. Cooling down for ${minutes} minutes before next batch...`);
+      await sleep(cooldown);
+    } else {
+      console.log('\n🏁 Final batch complete.');
+    }
   }
-  console.log('\n🏁 All locations processed.');
+  console.log('\n✅ All locations processed.');
 })();
