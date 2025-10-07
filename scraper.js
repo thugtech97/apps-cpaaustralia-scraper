@@ -1,4 +1,6 @@
 // scrape-cpa.js
+// Updated: increased backoffs, batch cooldowns, slower human-like pacing,
+// smaller batches, Cloudflare-specific cooldown, and extra idle after rate-limit.
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 
@@ -6,26 +8,17 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const jitter = (min, max) => Math.floor(min + Math.random() * (max - min));
 const rand = (a, b) => jitter(a, b);
 
+// ======= Tunables (changed) =======
 const MAX_RETRIES_PER_LOCATION = 4;
-const BASE_BACKOFF_MS = 60_000;
-const BETWEEN_LOCATIONS_MS = [2_000, 3_500];
-const BETWEEN_BATCH_MS = [3 * 60_000, 5 * 60_000]; // 3-5 minutes
-const SLOWMO_MS = 60;
-const BATCH_SIZE = 5;
+const BASE_BACKOFF_MS = 90_000;                    // base backoff 90s
+const BETWEEN_LOCATIONS_MS = [3_500, 7_000];       // 3.5s - 7s between locations
+const BETWEEN_BATCH_MS = [5 * 60_000, 7 * 60_000]; // 5 - 7 minutes between batches
+const SLOWMO_MS = 150;                             // slowMo to look more human
+const BATCH_SIZE = 3;                              // smaller batches
+// ==================================
 
 const LOCATIONS = [
-  "Allandale",
-  "Allenstown", "Allenview", "Alligator Creek", "Allora", "Alloway",
-  "Almaden", "Aloomba", "Alpha", "Alsace", "Alton Downs",
-  "Alva", "Amamoor", "Amamoor Creek", "Amaroo", "Amber",
-  "Amberley", "Ambrose", "Amby", "Amiens", "Amity",
-  "Anakie Siding", "Andergrove", "Anderleigh", "Andromache", "Anduramba",
-  "Annandale", "Annerley", "Anstead", "Anthony", "Antigua",
-  "Apple Tree Creek", "Applethorpe", "Arafura Sea", "Araluen", "Aramac",
-  "Aramara", "Arana Hills", "Aranbanga", "Aratula", "Arbouin",
-  "Arcadia", "Arcadia Valley", "Archer River", "Archerfield", "Arcturus",
-  "Argyll", "Armstrong Beach", "Armstrong Creek", "Aroona", "Arriga",
-  "Arundel", "Ascot", "Ashfield", "Ashgrove", "Ashmore",
+  "Ashmore",
   "Ashwell", "Aspley", "Atherton", "Athol", "Atkinsons Dam",
   "Aubigny", "Auburn", "Auchenflower", "Augathella", "Augustine Heights",
   "Aurukun", "Austinville", "Avenell Heights", "Avoca", "Avoca Vale",
@@ -38,14 +31,18 @@ function makeUA() {
        + `(KHTML, like Gecko) Chrome/${chromeMajor}.0.0.0 Safari/537.36`;
 }
 
-async function launchBrowser() {
+async function launchBrowser(proxy) {
+  const args = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+  ];
+  // If you decide to use proxies, pass `proxy` string to this function and uncomment:
+  // if (proxy) args.push(`--proxy-server=${proxy}`);
+
   return puppeteer.launch({
-    headless: false, // change to true in CI
+    headless: false, // set to true in CI if you prefer
     slowMo: SLOWMO_MS,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-    ],
+    args,
     defaultViewport: { width: 1280, height: 900 },
   });
 }
@@ -57,22 +54,32 @@ function attachRateLimitDetectors(page) {
     try {
       const status = res.status();
       if (status === 429) signals.rateLimited = true;
-    } catch { /* ignore */ }
+      // some Cloudflare responses might be 403 with a 1015 message in body
+      if (status === 403 || status === 451) {
+        // we still inspect DOM below for '1015'
+      }
+    } catch { /* ignore errors */ }
   });
 
-  page.on('requestfailed', (req) => { /* optional hook */ });
+  page.on('requestfailed', (req) => {
+    // optional hook for debugging, not used now
+    // console.warn(`Request failed: ${req.url()} ${req.failure()?.errorText}`);
+  });
 
   const checkDom = async () => {
     try {
       const html = (await page.content()).toLowerCase();
-      if (html.includes('error 1015') || html.includes('rate limited')) {
+      if (html.includes('error 1015') || html.includes('rate limited') || html.includes('you have been rate limited')) {
         signals.rateLimited = true;
         if (html.includes('1015')) signals.cloudflare1015 = true;
       }
     } catch { /* ignore */ }
   };
 
-  const timer = setInterval(checkDom, 1500);
+  const timer = setInterval(() => {
+    // run checkDom but swallow errors
+    checkDom().catch(()=>{});
+  }, 1500);
 
   return {
     signals,
@@ -82,22 +89,29 @@ function attachRateLimitDetectors(page) {
 }
 
 async function waitOnBlock(signals, attempt) {
-  if (signals.cloudflare1015) {
-    const cool = rand(8 * 60_000, 14 * 60_000); // 8–14 minutes
-    console.warn(`🛑 Cloudflare 1015 detected. Cooling down for ${Math.round(cool/60000)} min...`);
+  // Cloudflare 1015 gets a longer cooldown
+  if (signals?.cloudflare1015) {
+    const cool = rand(10 * 60_000, 18 * 60_000); // 10–18 minutes
+    console.warn(`\n🛑 Cloudflare 1015 detected. Cooling down for ~${Math.round(cool/60000)} minutes...`);
     await sleep(cool);
     return;
   }
+
+  // exponential backoff with bigger base and jitter
   const backoff = BASE_BACKOFF_MS * Math.pow(2, Math.max(0, attempt - 1));
-  const withJitter = backoff + rand(5_000, 25_000);
-  console.warn(`⏳ Rate limit/backoff: waiting ${(withJitter/1000).toFixed(0)}s (attempt ${attempt})...`);
+  const withJitter = backoff + rand(10_000, 45_000);
+  console.warn(`\n⏳ Rate limit detected. Backing off ${(withJitter/1000).toFixed(0)}s (attempt ${attempt})...`);
   await sleep(withJitter);
+
+  // extra idle to avoid retry spikes
+  const extraIdle = rand(30_000, 120_000); // 30s - 2min
+  console.warn(`🛌 Extra idle for ${(extraIdle/1000).toFixed(0)}s to reduce retry spike...`);
+  await sleep(extraIdle);
 }
 
 async function runOnce(location, attempt = 1) {
   console.log(`\n=== 🔍 Scraping: ${location} (attempt ${attempt}/${MAX_RETRIES_PER_LOCATION}) ===`);
   const browser = await launchBrowser();
-
   let detectors;
   try {
     const page = await browser.newPage();
@@ -140,7 +154,7 @@ async function runOnce(location, attempt = 1) {
     await page.waitForSelector('#initiateSearchBtn', { visible: true });
     await page.click('#initiateSearchBtn', { delay: rand(10, 40) });
 
-    // Wait for results
+    // Wait for results or check for rate-limit while waiting
     await Promise.race([
       page.waitForSelector('li.resultItem', { timeout: 30_000 }),
       (async () => {
@@ -195,21 +209,26 @@ async function runOnce(location, attempt = 1) {
     const cols = ['accountId','type','name','address','email','phone','website','lat','lng'];
     const esc = v => (v == null ? '' : `"${String(v).replace(/"/g, '""')}"`);
     const csv = [cols.join(','), ...results.map(r => cols.map(k => esc(r[k])).join(','))].join('\n');
-    fs.writeFileSync(`${location.replace(/[^\w\-]+/g, '_')}.csv`, csv, 'utf8');
 
-    console.log(`✅ Extracted ${results.length} records → ${location}.csv`);
+    // safe filename
+    const safeName = location.replace(/[^\w\-]+/g, '_');
+    fs.writeFileSync(`${safeName}.csv`, csv, 'utf8');
+
+    console.log(`✅ Extracted ${results.length} records → ${safeName}.csv`);
   } catch (err) {
-    const isRateLimited = detectors?.signals.rateLimited;
+    const isRateLimited = detectors?.signals?.rateLimited;
     console.error(`❌ Error on ${location}: ${err.message}${isRateLimited ? ' (rate limited)' : ''}`);
     if (attempt < MAX_RETRIES_PER_LOCATION) {
       await waitOnBlock(detectors?.signals || { rateLimited: false, cloudflare1015: false }, attempt);
-      await browser.close().catch(()=>{});
+      try { await browser.close(); } catch {}
       return runOnce(location, attempt + 1);
+    } else {
+      console.error(`⚠️ Max retries reached for ${location}. Skipping.`);
     }
   } finally {
     try { detectors?.stop?.(); } catch {}
     await sleep(1500);
-    await browser.close().catch(()=>{});
+    try { await browser.close(); } catch {}
   }
 }
 
@@ -220,12 +239,13 @@ async function runOnce(location, attempt = 1) {
     console.log(`\n--- Starting batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} locations) ---`);
     for (const loc of batch) {
       await runOnce(loc);
+
       // small pause between locations to mimic human behavior
       await sleep(rand(BETWEEN_LOCATIONS_MS[0], BETWEEN_LOCATIONS_MS[1]));
     }
 
     if (i + BATCH_SIZE < LOCATIONS.length) {
-      // cooldown between batches (3-5 minutes randomized)
+      // cooldown between batches (5-7 minutes randomized)
       const cooldown = rand(BETWEEN_BATCH_MS[0], BETWEEN_BATCH_MS[1]);
       const minutes = (cooldown / 60000).toFixed(2);
       console.log(`\n🛌 Batch complete. Cooling down for ${minutes} minutes before next batch...`);
